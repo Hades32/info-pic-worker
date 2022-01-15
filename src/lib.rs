@@ -2,16 +2,19 @@ use image::{
     png::{CompressionType, FilterType, PngEncoder},
     ColorType,
 };
+use serde::Deserialize;
+use std::convert::TryInto;
 use worker::*;
 
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyle},
+    mono_font::{
+        ascii::{FONT_10X20, FONT_7X13_BOLD},
+        MonoTextStyle,
+    },
     pixelcolor::Rgb888,
     prelude::*,
-    primitives::{
-        Circle, PrimitiveStyle, PrimitiveStyleBuilder, Rectangle, StrokeAlignment, Triangle,
-    },
-    text::{Alignment, Text},
+    primitives::{PrimitiveStyle, Rectangle},
+    text::{Alignment, Baseline, Text},
 };
 use embedded_graphics_simulator::{OutputSettingsBuilder, SimulatorDisplay};
 
@@ -29,57 +32,88 @@ fn log_request(req: &Request) {
 
 fn render(
     display: &mut SimulatorDisplay<Rgb888>,
+    quote: &Quote,
 ) -> std::result::Result<(), <SimulatorDisplay<Rgb888> as DrawTarget>::Error> {
     display.clear(Rgb888::WHITE)?;
-    // Create styles used by the drawing operations.
-    let thin_stroke = PrimitiveStyle::with_stroke(Rgb888::BLACK, 1);
-    let thick_stroke = PrimitiveStyle::with_stroke(Rgb888::BLACK, 3);
-    let border_stroke = PrimitiveStyleBuilder::new()
-        .stroke_color(Rgb888::BLACK)
-        .stroke_width(3)
-        .stroke_alignment(StrokeAlignment::Inside)
-        .build();
-    let fill = PrimitiveStyle::with_fill(Rgb888::BLACK);
-    let character_style = MonoTextStyle::new(&FONT_6X10, Rgb888::BLACK);
+    let dw: i32 = display.size().width.try_into().unwrap();
+    let dh: i32 = display.size().height.try_into().unwrap();
+    let highlight = PrimitiveStyle::with_fill(Rgb888::RED);
 
-    let yoffset = 14;
-
-    // Draw a 3px wide outline around the display.
-    display
-        .bounding_box()
-        .into_styled(border_stroke)
-        .draw(display)?;
-
-    // Draw a triangle.
-    Triangle::new(
-        Point::new(16, 16 + yoffset),
-        Point::new(16 + 16, 16 + yoffset),
-        Point::new(16 + 8, yoffset),
+    // Header
+    let head_h: i32 = dh / 4;
+    let head_font = MonoTextStyle::new(&FONT_10X20, Rgb888::WHITE);
+    let head_font_h: i32 = 20;
+    Rectangle::new(
+        Point::new(0, 0),
+        Size::new(dw.try_into().unwrap(), head_h.try_into().unwrap()),
     )
-    .into_styled(thin_stroke)
+    .into_styled(highlight)
     .draw(display)?;
-
-    // Draw a filled square
-    Rectangle::new(Point::new(52, yoffset), Size::new(16, 16))
-        .into_styled(fill)
-        .draw(display)?;
-
-    // Draw a circle with a 3px wide stroke.
-    Circle::new(Point::new(88, yoffset), 17)
-        .into_styled(thick_stroke)
-        .draw(display)?;
-
-    // Draw centered text.
-    let text = "embedded-graphics";
     Text::with_alignment(
-        text,
-        display.bounding_box().center() + Point::new(0, 15),
-        character_style,
+        "Quote of the Day",
+        Point::new(
+            display.bounding_box().center().x,
+            (head_font_h).try_into().unwrap(),
+        ),
+        head_font,
         Alignment::Center,
     )
     .draw(display)?;
 
+    // Quote
+    let quote_author_font = MonoTextStyle::new(&FONT_7X13_BOLD, Rgb888::BLACK);
+    let quote_font = MonoTextStyle::new(&FONT_10X20, Rgb888::BLACK);
+    let quote_author_font_h: i32 = 7;
+    let quote_font_w: i32 = 10;
+    let quote_font_h: i32 = 14;
+    let pad: i32 = 3;
+    Text::with_baseline(
+        quote.a.as_str(),
+        Point::new(pad, head_h + pad),
+        quote_author_font,
+        Baseline::Top,
+    )
+    .draw(display)?;
+
+    // wrapping the text
+    let words = quote.q.split_ascii_whitespace();
+    let max_line: usize = ((dw - 2 * pad) / quote_font_w).try_into().unwrap();
+    let mut line: Vec<&str> = vec![];
+    let mut line_len = 0;
+    let mut total_lines = 0;
+    let end_marker = "<end>";
+    for word in words.chain(vec![end_marker]) {
+        if line_len != 0 && line_len + word.len() > max_line || word == end_marker {
+            Text::with_baseline(
+                &line.join(" "),
+                Point::new(
+                    pad,
+                    head_h
+                        + pad
+                        + quote_author_font_h
+                        + 3*pad
+                        + pad * total_lines
+                        + quote_font_h * total_lines,
+                ),
+                quote_font,
+                Baseline::Top,
+            )
+            .draw(display)?;
+            total_lines += 1;
+            line.truncate(0);
+            line_len = 0;
+        }
+        line.push(word);
+        line_len += word.len() + 1;
+    }
+
     Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct Quote {
+    q: String,
+    a: String,
 }
 
 #[event(fetch)]
@@ -99,10 +133,28 @@ pub async fn main(req: Request, env: Env) -> Result<Response> {
     // Environment bindings like KV Stores, Durable Objects, Secrets, and Variables.
     router
         .get("/", |_, _| Response::ok("Hello from Workers!"))
-        .get("/image", |_req, _ctx| {
+        .get_async("/image", |_req, _ctx| async move {
             // Create a new simulator display with 128x64 pixels.
             let mut display: SimulatorDisplay<Rgb888> = SimulatorDisplay::new(Size::new(296, 128));
-            if let Err(_err) = render(&mut display) {
+
+            let quote_resp = Fetch::Url(Url::parse("https://zenquotes.io/api/today").unwrap())
+                .send()
+                .await;
+            if let Err(err) = quote_resp {
+                return Response::error(format!("no quotes available: {:?}", err), 503);
+            }
+            let mut quote_resp = quote_resp.unwrap();
+            // API is stupid...
+            let _ = quote_resp
+                .headers_mut()
+                .set("content-type", "application/json");
+            let quote_resp = quote_resp.json().await;
+            if let Err(err) = quote_resp {
+                return Response::error(format!("no JSON quotes available: {:?}", err), 503);
+            }
+            let quotes: Vec<Quote> = quote_resp.unwrap();
+
+            if let Err(_err) = render(&mut display, quotes.get(0).unwrap()) {
                 return Response::error("Bad Request", 400);
             }
 
